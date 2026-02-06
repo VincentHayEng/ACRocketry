@@ -1,0 +1,3 @@
+[submodule "ATOM"]
+	path = ATOM
+	url = https://github.com/tishap27/ATOM-Flight-Computer.git
