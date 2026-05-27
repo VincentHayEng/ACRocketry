@@ -1,1 +1,498 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <TinyGPSPlus.h>
 
+#define GPS_RX_PIN 17
+#define GPS_TX_PIN 16
+
+HardwareSerial GPS(2);
+TinyGPSPlus gps;
+WebServer server(80);
+
+const char* hotspotName = "HOT_SPOT_NAME";
+const char* hotspotPassword = "HOT_SPOT_PASSWORD";
+
+// Simulated rocket last GPS ping
+const double rocketLatFixed = 45.417250;
+const double rocketLonFixed = -75.698250;
+
+// 70 meters converted to feet
+const double rocketAltFixed = 229.66;
+
+const int rocketSatsFixed = 8;
+
+unsigned long lastGpsByteTime = 0;
+
+String twoDigits(int value) {
+  if (value < 10) return "0" + String(value);
+  return String(value);
+}
+
+String uptimeText() {
+  unsigned long totalSeconds = millis() / 1000;
+
+  unsigned long hours = totalSeconds / 3600;
+  unsigned long minutes = (totalSeconds % 3600) / 60;
+  unsigned long seconds = totalSeconds % 60;
+
+  return twoDigits(hours) + ":" + twoDigits(minutes) + ":" + twoDigits(seconds);
+}
+
+String groundGpsStatus() {
+  if (millis() - lastGpsByteTime > 3000) {
+    return "Ground GPS no connection";
+  }
+
+  if (!gps.location.isValid()) {
+    return "Ground GPS weak";
+  }
+
+  int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+  if (sats >= 6) return "Ground GPS strong";
+  if (sats >= 1) return "Ground GPS weak";
+
+  return "Ground GPS no fix";
+}
+
+String statusColor() {
+  String s = groundGpsStatus();
+
+  if (s == "Ground GPS strong") return "lime";
+  if (s == "Ground GPS weak") return "orange";
+
+  return "red";
+}
+
+String gpsTimeText() {
+  if (!gps.time.isValid()) {
+    return "No GPS time";
+  }
+
+  String t = "";
+  t += twoDigits(gps.time.hour());
+  t += ":";
+  t += twoDigits(gps.time.minute());
+  t += ":";
+  t += twoDigits(gps.time.second());
+  t += " UTC";
+
+  return t;
+}
+
+String dataJson() {
+  int groundSats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+  String groundLat = gps.location.isValid() ? String(gps.location.lat(), 6) : "null";
+  String groundLon = gps.location.isValid() ? String(gps.location.lng(), 6) : "null";
+  String groundAlt = gps.altitude.isValid() ? String(gps.altitude.feet(), 2) : "null";
+
+  String json = "{";
+  json += "\"status\":\"" + groundGpsStatus() + "\",";
+  json += "\"color\":\"" + statusColor() + "\",";
+  json += "\"groundSatellites\":" + String(groundSats) + ",";
+  json += "\"groundLatitude\":" + groundLat + ",";
+  json += "\"groundLongitude\":" + groundLon + ",";
+  json += "\"groundAltitude\":" + groundAlt + ",";
+  json += "\"rocketSatellites\":" + String(rocketSatsFixed) + ",";
+  json += "\"rocketLatitude\":" + String(rocketLatFixed, 6) + ",";
+  json += "\"rocketLongitude\":" + String(rocketLonFixed, 6) + ",";
+  json += "\"rocketAltitude\":" + String(rocketAltFixed, 2) + ",";
+  json += "\"gpsTime\":\"" + gpsTimeText() + "\",";
+  json += "\"uptime\":\"" + uptimeText() + "\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+
+  return json;
+}
+
+void noCache() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+}
+
+void handleRoot() {
+  noCache();
+
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ATLAS Ground Station</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #101010;
+      color: white;
+      font-family: Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    #map {
+      height: 33vh;
+      width: 100vw;
+      background: #202020;
+    }
+
+    #panel {
+      height: 67vh;
+      padding: 8px;
+      box-sizing: border-box;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      overflow: hidden;
+      background: #101010;
+    }
+
+    .column {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+      min-width: 0;
+    }
+
+    .title {
+      background: #262626;
+      border: 1px solid #444;
+      border-radius: 10px;
+      padding: 9px;
+      font-size: 15px;
+      font-weight: bold;
+      text-align: center;
+    }
+
+    .box {
+      background: #1b1b1b;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 9px;
+      min-height: 48px;
+    }
+
+    .label {
+      color: #aaa;
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+
+    .value {
+      font-size: 15px;
+      font-weight: bold;
+      word-break: break-word;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <div class="column">
+      <div class="title">Rocket / Tracker</div>
+
+      <div class="box">
+        <div class="label">Distance To Rocket</div>
+        <div class="value" id="distance">Waiting</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Bearing To Rocket</div>
+        <div class="value" id="bearing">Waiting</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Rocket Satellites</div>
+        <div class="value" id="rocketSats">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Rocket Altitude</div>
+        <div class="value" id="rocketAlt">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Rocket Latitude</div>
+        <div class="value" id="rocketLat">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Rocket Longitude</div>
+        <div class="value" id="rocketLon">Loading</div>
+      </div>
+    </div>
+
+    <div class="column">
+      <div class="title">Ground Station</div>
+
+      <div class="box">
+        <div class="label">Ground GPS Status</div>
+        <div class="value" id="status">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Ground Satellites</div>
+        <div class="value" id="groundSats">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Ground Altitude</div>
+        <div class="value" id="groundAlt">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Ground Latitude</div>
+        <div class="value" id="groundLat">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Ground Longitude</div>
+        <div class="value" id="groundLon">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">GPS Time</div>
+        <div class="value" id="gpsTime">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">Time Since Power On</div>
+        <div class="value" id="uptime">Loading</div>
+      </div>
+
+      <div class="box">
+        <div class="label">ESP32 IP</div>
+        <div class="value" id="ip">Loading</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    let groundLat = null;
+    let groundLon = null;
+
+    let rocketLat = 45.417250;
+    let rocketLon = -75.698250;
+
+    let mapHasCentered = false;
+
+    let map = L.map("map").setView([rocketLat, rocketLon], 16);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19
+    }).addTo(map);
+
+    let rocketMarker = L.circleMarker([rocketLat, rocketLon], {
+      radius: 9,
+      color: "red",
+      fillColor: "red",
+      fillOpacity: 1
+    }).addTo(map);
+
+    rocketMarker.bindPopup("Simulated rocket last ping");
+
+    let groundMarker = null;
+    let lineToRocket = null;
+
+    function toRad(value) {
+      return value * Math.PI / 180;
+    }
+
+    function toDeg(value) {
+      return value * 180 / Math.PI;
+    }
+
+    function bearingToRocket(lat1, lon1, lat2, lon2) {
+      let phi1 = toRad(lat1);
+      let phi2 = toRad(lat2);
+      let deltaLon = toRad(lon2 - lon1);
+
+      let y = Math.sin(deltaLon) * Math.cos(phi2);
+      let x = Math.cos(phi1) * Math.sin(phi2) -
+              Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLon);
+
+      let bearing = toDeg(Math.atan2(y, x));
+      bearing = (bearing + 360) % 360;
+
+      return bearing;
+    }
+
+    function distanceToRocketMeters(lat1, lon1, lat2, lon2) {
+      let earthRadius = 6371000;
+
+      let dLat = toRad(lat2 - lat1);
+      let dLon = toRad(lon2 - lon1);
+
+      let a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+      let c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+      return earthRadius * c;
+    }
+
+    function updateDistanceAndBearing() {
+  if (groundLat === null || groundLon === null) {
+    document.getElementById("distance").textContent = "Waiting";
+    document.getElementById("bearing").textContent = "Waiting";
+    return;
+  }
+
+  let bearing = bearingToRocket(groundLat, groundLon, rocketLat, rocketLon);
+  let distanceMeters = distanceToRocketMeters(groundLat, groundLon, rocketLat, rocketLon);
+
+  document.getElementById("distance").textContent = distanceMeters.toFixed(1) + " m";
+  document.getElementById("bearing").textContent = bearing.toFixed(0) + " deg true";
+}
+
+    function showNull(value, decimals, suffix) {
+      if (value === null) return "No fix";
+      return value.toFixed(decimals) + suffix;
+    }
+
+    function updateData() {
+      fetch("/data?v=" + Date.now())
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById("status").textContent = data.status;
+          document.getElementById("status").style.color = data.color;
+
+          document.getElementById("groundSats").textContent = data.groundSatellites;
+          document.getElementById("rocketSats").textContent = data.rocketSatellites;
+
+          document.getElementById("rocketAlt").textContent = data.rocketAltitude.toFixed(2) + " ft";
+          document.getElementById("rocketLat").textContent = data.rocketLatitude.toFixed(6);
+          document.getElementById("rocketLon").textContent = data.rocketLongitude.toFixed(6);
+
+          document.getElementById("groundAlt").textContent = showNull(data.groundAltitude, 2, " ft");
+          document.getElementById("groundLat").textContent = showNull(data.groundLatitude, 6, "");
+          document.getElementById("groundLon").textContent = showNull(data.groundLongitude, 6, "");
+
+          document.getElementById("gpsTime").textContent = data.gpsTime;
+          document.getElementById("uptime").textContent = data.uptime;
+          document.getElementById("ip").textContent = data.ip;
+
+          rocketLat = data.rocketLatitude;
+          rocketLon = data.rocketLongitude;
+
+          rocketMarker.setLatLng([rocketLat, rocketLon]);
+
+          if (data.groundLatitude === null || data.groundLongitude === null) {
+            groundLat = null;
+            groundLon = null;
+            updateDistanceAndBearing();
+            return;
+          }
+
+          groundLat = data.groundLatitude;
+          groundLon = data.groundLongitude;
+
+          if (groundMarker === null) {
+            groundMarker = L.circleMarker([groundLat, groundLon], {
+              radius: 9,
+              color: "blue",
+              fillColor: "blue",
+              fillOpacity: 1
+            }).addTo(map);
+
+            groundMarker.bindPopup("Ground station GPS");
+          } else {
+            groundMarker.setLatLng([groundLat, groundLon]);
+          }
+
+          if (lineToRocket === null) {
+            lineToRocket = L.polyline([[groundLat, groundLon], [rocketLat, rocketLon]], {
+              color: "red",
+              weight: 3
+            }).addTo(map);
+          } else {
+            lineToRocket.setLatLngs([[groundLat, groundLon], [rocketLat, rocketLon]]);
+          }
+
+          if (!mapHasCentered) {
+            map.fitBounds([[groundLat, groundLon], [rocketLat, rocketLon]], {
+              padding: [40, 40]
+            });
+            mapHasCentered = true;
+          }
+
+          updateDistanceAndBearing();
+        })
+        .catch(error => {
+          document.getElementById("status").textContent = "ESP32 data error";
+          document.getElementById("status").style.color = "red";
+        });
+    }
+
+    setInterval(updateData, 1000);
+    updateData();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", page);
+}
+
+void handleData() {
+  noCache();
+  server.send(200, "application/json", dataJson());
+}
+
+void connectToHotspot() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(hotspotName, hotspotPassword);
+
+  Serial.println();
+  Serial.println("Connecting to phone hotspot...");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("ATLAS ground station connected");
+  Serial.print("Open this on your phone: http://");
+  Serial.println(WiFi.localIP());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  GPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  connectToHotspot();
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+
+  Serial.println("Web server started");
+}
+
+void loop() {
+  server.handleClient();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToHotspot();
+  }
+
+  while (GPS.available()) {
+    char c = GPS.read();
+    gps.encode(c);
+    lastGpsByteTime = millis();
+    Serial.write(c);
+  }
+}
